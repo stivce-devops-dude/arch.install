@@ -73,14 +73,7 @@ prompt_password() {
   info "Password hash generated"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MIRRORS
-# ══════════════════════════════════════════════════════════════════════════════
-setup_mirrors() {
-  info "Ranking mirrors by speed (this may take a moment)..."
-  reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-  sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
-}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DISK SELECTION
@@ -133,6 +126,8 @@ confirm_install() {
 # PARTITIONING
 # ══════════════════════════════════════════════════════════════════════════════
 partition_disk() {
+  wipefs -af "$DISK"
+  sgdisk --zap-all "$DISK"
   parted -a optimal -s "$DISK" \
     mklabel gpt \
     mkpart ESP fat32 1MiB 513MiB \
@@ -230,7 +225,6 @@ main() {
 
   prompt_username
   prompt_password
-  setup_mirrors
 
   select_disk
   confirm_install
