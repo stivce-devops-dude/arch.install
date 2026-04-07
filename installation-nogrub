@@ -5,6 +5,7 @@ set -euo pipefail
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 readonly LOCALE="en_US.UTF-8"
+readonly HOSTNAME="artix-meta"
 
 USERNAME=""
 PW_HASH=""
@@ -98,7 +99,7 @@ select_disk() {
     done < <(lsblk -dno NAME,RM -e 7,11 | awk '$2 == 0 {print $1}')
 
     local chosen
-    chosen=$(dialog --clear --title "Arch Linux Installer" \
+    chosen=$(dialog --clear --title "Artix Installer" \
       --menu "Select installation drive: (drives marked [WINDOWS] are blocked)" \
       20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
 
@@ -117,7 +118,7 @@ confirm_install() {
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
 
   dialog --clear --title "Confirm Installation" \
-    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:    $USERNAME\nLocale:  $LOCALE\n\nProceed with installation?" \
+    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:     $USERNAME\nHostname: $HOSTNAME\nLocale:   $LOCALE\n\nProceed with installation?" \
     20 60 || { clear; echo "Aborted."; exit 1; }
   clear
 }
@@ -164,52 +165,55 @@ mount_partitions() {
 # BASE INSTALL
 # ══════════════════════════════════════════════════════════════════════════════
 install_base() {
-  pacstrap /mnt \
-    base base-devel \
-    linux linux-firmware \
+  basestrap /mnt \
+    base base-devel runit elogind-runit \
+    linux linux-headers linux-firmware \
     intel-ucode efibootmgr \
-    networkmanager openssh \
-    sudo python git
+    networkmanager networkmanager-runit \
+    openssh openssh-runit \
+    sudo python git ansible
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FSTAB
 # ══════════════════════════════════════════════════════════════════════════════
 generate_fstab() {
-  genfstab -U /mnt >> /mnt/etc/fstab
+  fstabgen -U /mnt >> /mnt/etc/fstab
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CHROOT CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 configure_chroot() {
-  arch-chroot /mnt /usr/bin/env \
+  artix-chroot /mnt /usr/bin/env \
     USERNAME="$USERNAME" \
     PW_HASH="$PW_HASH" \
+    HOSTNAME="$HOSTNAME" \
     LOCALE="$LOCALE" \
     DISK="$DISK" \
     /bin/bash <<'EOF'
 set -euo pipefail
 
+# Localization
 echo "$LOCALE UTF-8" >> /etc/locale.gen
 locale-gen
 echo "LANG=$LOCALE" > /etc/locale.conf
 echo 'KEYMAP=us'    > /etc/vconsole.conf
+ln -sf /usr/share/zoneinfo/Europe/Vienna /etc/localtime
 
-ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-
+# Hostname
+echo "$HOSTNAME" > /etc/hostname
 cat > /etc/hosts <<HOSTS
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   localhost.localdomain localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
 
-sed -i 's|^HOOKS=.*|HOOKS=(base udev autodetect microcode modconf keyboard keymap block filesystems fsck)|' \
-  /etc/mkinitcpio.conf
-mkinitcpio -P
+# Services
+ln -s /etc/runit/sv/NetworkManager /etc/runit/runsvdir/default/
+ln -s /etc/runit/sv/sshd           /etc/runit/runsvdir/default/
 
-systemctl enable NetworkManager sshd
-
+# User setup
 useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
@@ -217,27 +221,23 @@ chmod 0440 /etc/sudoers.d/wheel
 printf 'root:%s\n'          "$PW_HASH" | chpasswd -e
 printf '%s:%s\n' "$USERNAME" "$PW_HASH" | chpasswd -e
 
-ROOT_UUID=$(blkid -s UUID -o value "$(findmnt -n -o SOURCE /)")
-CPU_VENDOR=$(grep -oP 'vendor_id.*:\s*\K\w+' /proc/cpuinfo | head -1)
+# EFISTUB — clean up stale entries first
+while read -r bootnum; do
+  efibootmgr -b "$bootnum" -B
+done < <(efibootmgr -v | grep "Artix Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
 
-if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
-  INITRD_IMG="initramfs-linux.img"
-  UCODE="amd-ucode.img"
-else
-  INITRD_IMG="initramfs-linux.img"
-  UCODE="intel-ucode.img"
-fi
+  ROOT_UUID=$(blkid -s UUID -o value "$(findmnt -n -o SOURCE /)")
 
-cp /mnt/boot/vmlinuz-linux /mnt/boot/
-cp /mnt/boot/"$UCODE" /mnt/boot/ 2>/dev/null || true
-cp /mnt/boot/"$INITRD_IMG" /mnt/boot/
+  cp /mnt/boot/vmlinuz-linux /mnt/boot/
+  cp /mnt/boot/intel-ucode.img /mnt/boot/ 2>/dev/null || true
+  cp /mnt/boot/initramfs-linux.img /mnt/boot/
 
-efibootmgr --create --disk "$DISK" --part 1 --label "Arch Linux" \
-    --loader /vmlinuz-linux \
-    --unicode "root=UUID=${ROOT_UUID} rw initrd=\${UCODE} initrd=\${INITRD_IMG}" --verbose
+  efibootmgr --create --disk "$DISK" --part 1 --label "Artix Speed Meta" \
+      --loader /vmlinuz-linux \
+      --unicode "root=UUID=${ROOT_UUID} rw initrd=\intel-ucode.img initrd=\initramfs-linux.img init=/sbin/runit-init quiet loglevel=3 nowatchdog nmi_watchdog=0 rd.luks=0 rd.lvm=0" --verbose
 
-BOOT_ORDER=$(efibootmgr -v | grep -oP 'Boot\K[0-9A-Fa-f]{4}' | head -1)
-efibootmgr -o "$BOOT_ORDER"
+  BOOT_ORDER=$(efibootmgr -v | grep -oP 'Boot\K[0-9A-Fa-f]{4}' | head -1)
+  efibootmgr -o "$BOOT_ORDER"
 
 EOF
 }
@@ -282,13 +282,14 @@ main() {
 # ══════════════════════════════════════════════════════════════════════════════
 show_summary() {
   local pkg_count
-  pkg_count=$(arch-chroot /mnt pacman -Q 2>/dev/null | wc -l)
+  pkg_count=$(artix-chroot /mnt pacman -Q 2>/dev/null | wc -l)
   clear
   cat <<SUMMARY
-═════════════════════════════════════════════════════════════════════════════
-  Arch Linux Installation Complete
-═════════════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════════════
+  Artix Linux Installation Complete
+══════════════════════════════════════════════════════════════════════════════
 
+  Hostname:   $HOSTNAME
   Username:   $USERNAME
   Locale:     $LOCALE
   Packages:   $pkg_count
@@ -299,9 +300,9 @@ show_summary() {
     ${PART}3  HOME        rest   /home
 
   Services:   NetworkManager, sshd
-  Bootloader: EFISTUB (linux + efibootmgr)
+  Bootloader: EFISTUB (linux)
 
-═════════════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════════════
 SUMMARY
 }
 
