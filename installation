@@ -5,9 +5,14 @@ set -euo pipefail
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 readonly LOCALE="en_US.UTF-8"
+readonly HOSTNAME="arch-meta"
+readonly TIMEZONE="Europe/Vienna"
 
 USERNAME=""
 PW_HASH=""
+UCODE=""
+DISK=""
+PART=""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -31,7 +36,21 @@ trap cleanup EXIT
 check_prerequisites() {
   [[ $EUID -eq 0 ]]                  || die "Must be run as root."
   [[ -d /sys/firmware/efi/efivars ]] || die "Not booted in UEFI mode."
-  command -v dialog &>/dev/null      || { info "Installing dialog..."; pacman -Sy --noconfirm dialog; }
+
+  info "Checking network connectivity..."
+  ping -c1 -W5 archlinux.org &>/dev/null || die "No network connectivity. Connect to the internet and try again."
+
+  command -v dialog  &>/dev/null     || { info "Installing dialog...";   pacman -Sy --noconfirm dialog;   }
+  command -v sgdisk  &>/dev/null     || { info "Installing gptfdisk..."; pacman -Sy --noconfirm gptfdisk; }
+  command -v parted  &>/dev/null     || { info "Installing parted...";   pacman -Sy --noconfirm parted;   }
+  command -v openssl &>/dev/null     || { info "Installing openssl...";  pacman -Sy --noconfirm openssl;  }
+
+  case $(grep -m1 'vendor_id' /proc/cpuinfo) in
+    *GenuineIntel*) UCODE="intel-ucode" ;;
+    *AuthenticAMD*) UCODE="amd-ucode"   ;;
+    *)              UCODE=""            ;;
+  esac
+  [[ -n "$UCODE" ]] && info "CPU microcode: $UCODE" || info "CPU microcode: none detected"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -45,8 +64,15 @@ prompt_username() {
 
   while true; do
     USERNAME=$(dialog --clear --inputbox "Enter username:" 8 40 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
-    [[ -n "$USERNAME" ]] && break
-    dialog --msgbox "Username cannot be empty." 6 40
+    if [[ -z "$USERNAME" ]]; then
+      dialog --msgbox "Username cannot be empty." 6 40
+    elif [[ "$USERNAME" == "root" ]]; then
+      dialog --msgbox "'root' is not allowed as a username." 6 45
+    elif [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+      dialog --msgbox "Invalid username. Use lowercase letters, numbers, '-' or '_'.\nMust start with a letter or underscore." 7 55
+    else
+      break
+    fi
   done
   clear
   info "Username set to: $USERNAME"
@@ -60,10 +86,10 @@ prompt_password() {
 
   local pass1 pass2
   while true; do
-    pass1=$(dialog --clear --insecure --passwordbox "Enter password for root and $USERNAME:" 8 50 3>&1 1>&2 2>&3)
+    pass1=$(dialog --clear --insecure --passwordbox "Enter password for root and $USERNAME:" 8 50 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
     [[ -n "$pass1" ]] || { dialog --msgbox "Password cannot be empty." 6 40; continue; }
 
-    pass2=$(dialog --clear --insecure --passwordbox "Confirm password:" 8 40 3>&1 1>&2 2>&3)
+    pass2=$(dialog --clear --insecure --passwordbox "Confirm password:" 8 40 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
     [[ "$pass1" == "$pass2" ]] && break
 
     dialog --msgbox "Passwords do not match. Try again." 6 40
@@ -72,8 +98,6 @@ prompt_password() {
   PW_HASH=$(openssl passwd -6 "$pass1")
   info "Password hash generated"
 }
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DISK SELECTION
@@ -97,8 +121,10 @@ select_disk() {
       menu_items+=("$path" "$label")
     done < <(lsblk -dno NAME,RM -e 7,11 | awk '$2 == 0 {print $1}')
 
+    [[ ${#menu_items[@]} -eq 0 ]] && { dialog --msgbox "No suitable disks found." 6 40; clear; exit 1; }
+
     local chosen
-    chosen=$(dialog --clear --title "Arch Linux Installer" \
+    chosen=$(dialog --clear --title "Arch Installer" \
       --menu "Select installation drive: (drives marked [WINDOWS] are blocked)" \
       20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
 
@@ -117,7 +143,7 @@ confirm_install() {
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
 
   dialog --clear --title "Confirm Installation" \
-    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:    $USERNAME\nLocale:  $LOCALE\n\nProceed with installation?" \
+    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:     $USERNAME\nHostname: $HOSTNAME\nLocale:   $LOCALE\n\nProceed with installation?" \
     20 60 || { clear; echo "Aborted."; exit 1; }
   clear
 }
@@ -126,6 +152,15 @@ confirm_install() {
 # PARTITIONING
 # ══════════════════════════════════════════════════════════════════════════════
 partition_disk() {
+  local disk_mib
+  disk_mib=$(( $(lsblk -bdno SIZE "$DISK") / 1024 / 1024 ))
+  (( disk_mib >= 131585 )) || die "Disk too small (${disk_mib} MiB); need at least ~128.5 GiB."
+
+  swapoff -a 2>/dev/null || true
+  while read -r p; do
+    umount -f "/dev/$p" 2>/dev/null || true
+  done < <(lsblk -nlo NAME "$DISK" | tail -n +2)
+
   wipefs -af "$DISK"
   sgdisk --zap-all "$DISK"
   parted -a optimal -s "$DISK" \
@@ -159,61 +194,143 @@ mount_partitions() {
 # BASE INSTALL
 # ══════════════════════════════════════════════════════════════════════════════
 install_base() {
-  pacstrap /mnt \
-    base linux linux-firmware amd-ucode \
-    efibootmgr grub dialog \
-    networkmanager openssh sudo \
-    python
+  local pkgs=(
+    base base-devel
+    linux linux-headers linux-firmware
+    efibootmgr
+    dhcpcd
+    openssh
+    sudo python git ansible neovim
+  )
+  [[ -n "$UCODE" ]] && pkgs+=("$UCODE")
+  pacstrap /mnt "${pkgs[@]}"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FSTAB
 # ══════════════════════════════════════════════════════════════════════════════
 generate_fstab() {
-  genfstab -U /mnt >> /mnt/etc/fstab
+  genfstab -U /mnt > /mnt/etc/fstab
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CHROOT CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 configure_chroot() {
+  echo "$PW_HASH" > /mnt/root/.pwhash
+  chmod 600 /mnt/root/.pwhash
+
   arch-chroot /mnt /usr/bin/env \
     USERNAME="$USERNAME" \
-    PW_HASH="$PW_HASH" \
+    HOSTNAME="$HOSTNAME" \
     LOCALE="$LOCALE" \
+    TIMEZONE="$TIMEZONE" \
+    DISK="$DISK" \
+    PART="$PART" \
+    UCODE="$UCODE" \
     /bin/bash <<'EOF'
 set -euo pipefail
 
-echo "$LOCALE UTF-8" >> /etc/locale.gen
+enable_multilib() {
+  sed -i '/^#\[multilib\]/,/^#Include/s/^#//' /etc/pacman.conf
+}
+
+PW_HASH=$(cat /root/.pwhash)
+shred -u /root/.pwhash
+
+# Localization
+grep -qxF "$LOCALE UTF-8" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
 locale-gen
+
+# Enable multilib
+enable_multilib
 echo "LANG=$LOCALE" > /etc/locale.conf
 echo 'KEYMAP=us'    > /etc/vconsole.conf
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+hwclock --systohc
 
+# Hostname
+echo "$HOSTNAME" > /etc/hostname
 cat > /etc/hosts <<HOSTS
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   localhost.localdomain localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
 
-sed -i 's|^HOOKS=.*|HOOKS=(base udev autodetect microcode modconf keyboard keymap block filesystems fsck)|' \
-  /etc/mkinitcpio.conf
-mkinitcpio -P
+# Services
+systemctl enable dhcpcd
+systemctl enable sshd
 
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
-
-systemctl enable NetworkManager sshd
-
-useradd -m "$USERNAME"
-usermod -aG wheel "$USERNAME"
-
+# User setup
+useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
 
-printf 'root:%s\n'        "$PW_HASH" | chpasswd -e
+printf 'root:%s\n'           "$PW_HASH" | chpasswd -e
 printf '%s:%s\n' "$USERNAME" "$PW_HASH" | chpasswd -e
 
+# EFISTUB — clean up stale entries first
+while read -r bootnum; do
+  efibootmgr -b "$bootnum" -B
+done < <(efibootmgr -v | grep "Arch Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
+
+ROOT_UUID=$(blkid -s UUID -o value "${PART}2")
+[[ -n "$ROOT_UUID" ]] || { echo "ERROR: Could not determine root partition UUID." >&2; exit 1; }
+
+UCODE_INITRD=""
+[[ -n "$UCODE" ]] && UCODE_INITRD="initrd=\\${UCODE}.img "
+
+[[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found, aborting." >&2; exit 1; }
+
+efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
+    --loader /vmlinuz-linux \
+    --unicode "root=UUID=${ROOT_UUID} rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 rd.luks=0 rd.lvm=0" --verbose
+
 EOF
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUMMARY & REBOOT
+# ══════════════════════════════════════════════════════════════════════════════
+
+show_summary() {
+  local pkg_count part1_size part2_size part3_size
+  pkg_count=$(arch-chroot /mnt pacman -Q 2>/dev/null | wc -l)
+  part1_size=$(lsblk -dno SIZE "${PART}1" 2>/dev/null)
+  part2_size=$(lsblk -dno SIZE "${PART}2" 2>/dev/null)
+  part3_size=$(lsblk -dno SIZE "${PART}3" 2>/dev/null)
+  clear
+  cat <<SUMMARY
+══════════════════════════════════════════════════════════════════════════════
+  Arch Linux Installation Complete
+══════════════════════════════════════════════════════════════════════════════
+
+  Hostname:   $HOSTNAME
+  Username:   $USERNAME
+  Locale:     $LOCALE
+  Timezone:   $TIMEZONE
+  Packages:   $pkg_count
+
+  Disk:       $DISK
+    ${PART}1  EFI_SYSTEM  ${part1_size}   /boot
+    ${PART}2  ROOT        ${part2_size}   /
+    ${PART}3  HOME        ${part3_size}   /home
+
+  Services:   dhcpcd, sshd
+  Bootloader: EFISTUB (linux)
+  Microcode:  ${UCODE:-none}
+
+══════════════════════════════════════════════════════════════════════════════
+SUMMARY
+}
+
+prompt_reboot() {
+  echo ""
+  read -rp "  Press ENTER to unmount and reboot..."
+  info "Unmounting..."
+  umount -R /mnt 2>/dev/null || true
+  info "Rebooting..."
+  reboot
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,7 +338,6 @@ EOF
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
   check_prerequisites
-  timedatectl set-ntp true
 
   prompt_username
   prompt_password
@@ -248,7 +364,8 @@ main() {
   info "Configuring system in chroot..."
   configure_chroot
 
-  info "Installation complete. You can now reboot."
+  show_summary
+  prompt_reboot
 }
 
 main "$@"
