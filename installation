@@ -232,7 +232,6 @@ install_base() {
     linux linux-firmware
     cryptsetup
     efibootmgr
-    dhcpcd
     openssh
     sudo git neovim
   )
@@ -245,6 +244,7 @@ install_base() {
 # ══════════════════════════════════════════════════════════════════════════════
 generate_fstab() {
   genfstab -U /mnt > /mnt/etc/fstab
+  sed -i 's/\brelatime\b/noatime/g' /mnt/etc/fstab
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,8 +289,9 @@ shred -u /root/.pwhash
 grep -qxF "$LOCALE UTF-8" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
 locale-gen
 
-# Enable multilib
+# Enable multilib and parallel downloads
 enable_multilib
+sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 echo "LANG=$LOCALE" > /etc/locale.conf
 echo 'KEYMAP=us'    > /etc/vconsole.conf
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
@@ -307,14 +308,41 @@ HOSTS
 # crypttab — unlock home at boot using keyfile stored on the encrypted root
 echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
 
-# mkinitcpio — insert encrypt hook before filesystems
+# mkinitcpio — insert encrypt hook, switch to zstd for faster boot
 sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
+sed -i 's/^#*COMPRESSION=.*/COMPRESSION="zstd"/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
 # Services
-systemctl enable dhcpcd
 systemctl enable sshd
 systemctl enable systemd-timesyncd
+systemctl enable systemd-networkd
+systemctl enable systemd-resolved
+systemctl enable fstrim.timer
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+# Network — DHCP on wired and wireless
+cat > /etc/systemd/network/20-wired.network <<NETCONF
+[Match]
+Name=en*
+
+[Network]
+DHCP=yes
+
+[DHCP]
+RouteMetric=10
+NETCONF
+
+cat > /etc/systemd/network/25-wireless.network <<NETCONF
+[Match]
+Name=wl*
+
+[Network]
+DHCP=yes
+
+[DHCP]
+RouteMetric=20
+NETCONF
 
 # SSH hardening — key-based auth only, no root login
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
@@ -343,7 +371,7 @@ UCODE_INITRD=""
 
 efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
     --loader /vmlinuz-linux \
-    --unicode "cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 rd.lvm=0" --verbose
+    --unicode "cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1 rd.lvm=0" --verbose
 
 EOF
 }
@@ -375,7 +403,7 @@ show_summary() {
     ${PART}2  ROOT        ${part2_size}   /          (LUKS2)
     ${PART}3  HOME        ${part3_size}   /home      (LUKS2, keyfile)
 
-  Services:   dhcpcd, sshd, systemd-timesyncd
+  Services:   sshd, systemd-networkd, systemd-resolved, systemd-timesyncd, fstrim.timer
   Bootloader: EFISTUB (linux)
   Microcode:  ${UCODE:-none}
   Encryption: LUKS2 — enter passphrase at boot
