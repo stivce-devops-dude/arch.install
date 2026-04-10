@@ -60,6 +60,7 @@ cleanup() {
   exit $exit_code
 }
 trap cleanup EXIT
+trap 'die "Unexpected failure at line $LINENO — check output above."' ERR
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PREREQUISITES
@@ -68,7 +69,13 @@ check_environment() {
   [[ $EUID -eq 0 ]]                  || die "Must be run as root."
   [[ -d /sys/firmware/efi/efivars ]] || die "Not booted in UEFI mode."
   info "Checking network connectivity..."
-  ping -c1 -W5 archlinux.org &>/dev/null || die "No network connectivity. Connect to the internet and try again."
+  local attempts=5
+  for (( i=1; i<=attempts; i++ )); do
+    ping -c1 -W5 archlinux.org &>/dev/null && break
+    [[ $i -eq $attempts ]] && die "No network connectivity after $attempts attempts."
+    info "Network check failed, retrying ($i/$attempts)..."
+    sleep 3
+  done
 }
 
 ensure_tools() {
@@ -169,7 +176,7 @@ prompt_ssh_key() {
 build_disk_menu() {
   while IFS= read -r dev; do
     local path="/dev/$dev" size model label
-    size=$(lsblk  -dno SIZE  "$path" 2>/dev/null)
+    size=$(lsblk -dno SIZE "$path" 2>/dev/null) || { echo "WARNING: skipping $path (lsblk failed)" >&2; continue; }
     model=$(lsblk -dno MODEL "$path" 2>/dev/null | xargs)
     is_windows_disk "$path" && label="[WINDOWS] ${size} ${model}" || label="${size} ${model}"
     printf '%s\n%s\n' "$path" "$label"
@@ -282,7 +289,7 @@ install_base() {
     sudo git neovim
   )
   [[ -n "$UCODE" ]] && pkgs+=("$UCODE")
-  pacstrap /mnt "${pkgs[@]}"
+  pacstrap -K /mnt "${pkgs[@]}"
 }
 
 generate_fstab() {
@@ -325,7 +332,9 @@ configure_chroot() {
     SSH_PUBKEY="$SSH_PUBKEY" \
     /bin/bash <<'EOF'
 set -euo pipefail
+die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
+trap 'die "Chroot configuration failed at line $LINENO."' ERR
 
 configure_pacman() {
   sed -i '/^#\[multilib\]/,/^#Include/s/^#//' /etc/pacman.conf
@@ -339,7 +348,7 @@ configure_locale() {
   echo "LANG=$LOCALE" > /etc/locale.conf
   echo 'KEYMAP=us'    > /etc/vconsole.conf
   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
-  hwclock --systohc
+  hwclock --systohc 2>/dev/null || true
   info "Locale: $LOCALE, timezone: $TIMEZONE"
 }
 
@@ -525,7 +534,8 @@ main() {
 
   step "Preparing disk: $DISK"
   partition_disk
-  partprobe "$DISK" || die "partprobe failed. Partition table may not be updated."
+  partprobe "$DISK" 2>/dev/null || true
+  udevadm settle
   encrypt_partitions
   format_partitions
   mount_partitions
