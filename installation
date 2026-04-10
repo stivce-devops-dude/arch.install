@@ -9,11 +9,9 @@ readonly HOSTNAME="arch-meta"
 readonly TIMEZONE="Europe/Vienna"
 
 USERNAME=""
-PASSWORD=""          # plaintext — used to derive PW_HASH + LUKS_PASS; cleared after use
+PASSWORD=""
 PW_HASH=""
-LUKS_PASS=""         # plaintext — cleared after LUKS setup
-LUKS_HOME_KEYFILE="" # temp keyfile path — shredded after install
-SSH_PUBKEY=""        # optional — deployed to ~/.ssh/authorized_keys
+SSH_PUBKEY=""
 UCODE=""
 DISK=""
 PART=""
@@ -76,9 +74,6 @@ is_windows_disk() {
 # ══════════════════════════════════════════════════════════════════════════════
 teardown() {
   umount -R /mnt 2>/dev/null || true
-  cryptsetup close crypthome 2>/dev/null || true
-  cryptsetup close cryptroot 2>/dev/null || true
-  [[ -n "$LUKS_HOME_KEYFILE" ]] && shred -u "$LUKS_HOME_KEYFILE" 2>/dev/null || true
 }
 
 cleanup() {
@@ -112,7 +107,6 @@ ensure_tools() {
   ensure_pkg sgdisk   gptfdisk
   ensure_pkg parted
   ensure_pkg openssl
-  ensure_pkg cryptsetup
 }
 
 detect_ucode() {
@@ -147,21 +141,19 @@ prompt_username() {
 
 prompt_password() {
   if [[ -n "$PASSWORD" ]]; then
-    LUKS_PASS="$PASSWORD"
     PW_HASH=$(printf '%s' "$PASSWORD" | openssl passwd -6 -stdin)
     PASSWORD=""
     info "Password hash derived from PASSWORD"; return 0
   fi
 
   if [[ -n "$PW_HASH" ]]; then
-    [[ -n "$LUKS_PASS" ]] || die "LUKS_PASS must be set alongside PW_HASH (needed for disk encryption)."
     info "Using provided password hash"; return 0
   fi
 
   local pass1 pass2
   while true; do
     pass1=$(dialog --clear --insecure --passwordbox \
-      "Enter password for disk encryption, root, and $USERNAME:" 9 60 3>&1 1>&2 2>&3) \
+      "Enter password for $USERNAME and root:" 9 60 3>&1 1>&2 2>&3) \
       || { clear; die "Aborted."; }
     [[ -n "$pass1" ]] || { dialog --msgbox "Password cannot be empty." 6 40; continue; }
 
@@ -172,7 +164,6 @@ prompt_password() {
   done
   clear
 
-  LUKS_PASS="$pass1"
   PW_HASH=$(printf '%s' "$pass1" | openssl passwd -6 -stdin)
   info "Password hash generated"
 }
@@ -260,8 +251,8 @@ confirm_install() {
   local disk_info
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
   dialog --clear --title "Confirm Installation" \
-    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:       $USERNAME\nHostname:   $HOSTNAME\nLocale:     $LOCALE\nEncryption: LUKS2 (root + home)\n\nProceed with installation?" \
-    22 60 || { clear; die "Aborted."; }
+    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:       $USERNAME\nHostname:   $HOSTNAME\nLocale:     $LOCALE\n\nProceed with installation?" \
+    20 50 || { clear; die "Aborted."; }
   clear
 }
 
@@ -271,7 +262,7 @@ confirm_install() {
 partition_disk() {
   local disk_mib
   disk_mib=$(( $(lsblk -bdno SIZE "$DISK") / 1024 / 1024 ))
-  (( disk_mib >= 131585 )) || die "Disk too small (${disk_mib} MiB); need at least ~128.5 GiB."
+  (( disk_mib >= 65537 )) || die "Disk too small (${disk_mib} MiB); need at least ~64 GiB."
 
   swapoff -a 2>/dev/null || true
   while read -r p; do
@@ -285,39 +276,19 @@ partition_disk() {
     mkpart ESP fat32 1MiB 513MiB \
     set 1 esp on \
     name 1 EFI_SYSTEM \
-    mkpart primary ext4 513MiB 131585MiB \
-    name 2 ROOT \
-    mkpart primary ext4 131585MiB 100% \
-    name 3 HOME
-}
-
-encrypt_partitions() {
-  info "Encrypting root partition with LUKS2..."
-  printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode -d - "${PART}2"
-  printf '%s' "$LUKS_PASS" | cryptsetup open --type luks2 -d - "${PART}2" cryptroot
-
-  info "Generating home partition keyfile..."
-  LUKS_HOME_KEYFILE=$(mktemp)
-  dd if=/dev/urandom bs=512 count=4 2>/dev/null > "$LUKS_HOME_KEYFILE"
-
-  info "Encrypting home partition with LUKS2..."
-  cryptsetup luksFormat --type luks2 --batch-mode --key-file "$LUKS_HOME_KEYFILE" "${PART}3"
-  cryptsetup open --type luks2 --key-file "$LUKS_HOME_KEYFILE" "${PART}3" crypthome
-
-  LUKS_PASS=""
+    mkpart primary ext4 513MiB 100% \
+    name 2 ROOT
 }
 
 format_partitions() {
   mkfs.fat -F32 -n EFI_SYSTEM "${PART}1"
-  mkfs.ext4 -F  -L root       /dev/mapper/cryptroot
-  mkfs.ext4 -F  -L home       /dev/mapper/crypthome
+  mkfs.ext4 -F  -L root       "${PART}2"
 }
 
 mount_partitions() {
-  mount /dev/mapper/cryptroot /mnt
+  mount /dev/disk/by-label/root /mnt
   mkdir -p /mnt/{boot,home}
   mount -L EFI_SYSTEM /mnt/boot
-  mount /dev/mapper/crypthome /mnt/home
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -327,7 +298,6 @@ install_base() {
   local pkgs=(
     base
     linux linux-firmware
-    cryptsetup
     efibootmgr
     openssh
     sudo git neovim
@@ -349,20 +319,10 @@ generate_fstab() {
 stage_chroot_files() {
   printf '%s\n' "$PW_HASH" > /mnt/root/.pwhash
   chmod 600 /mnt/root/.pwhash
-
-  mkdir -p /mnt/etc/luks-keys
-  install -m 600 "$LUKS_HOME_KEYFILE" /mnt/etc/luks-keys/home.key
-  chmod 700 /mnt/etc/luks-keys
-  shred -u "$LUKS_HOME_KEYFILE"
-  LUKS_HOME_KEYFILE=""
 }
 
 configure_chroot() {
   stage_chroot_files
-
-  local home_uuid
-  home_uuid=$(blkid -s UUID -o value "${PART}3")
-  [[ -n "$home_uuid" ]] || die "Could not determine home partition UUID."
 
   arch-chroot /mnt /usr/bin/env \
     USERNAME="$USERNAME" \
@@ -372,7 +332,6 @@ configure_chroot() {
     DISK="$DISK" \
     PART="$PART" \
     UCODE="$UCODE" \
-    HOME_UUID="$home_uuid" \
     SSH_PUBKEY="$SSH_PUBKEY" \
     /bin/bash <<'EOF'
 set -euo pipefail
@@ -404,14 +363,6 @@ configure_hostname() {
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
   info "Hostname: $HOSTNAME"
-}
-
-configure_encryption() {
-  echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
-  sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
-  sed -i 's/^#*COMPRESSION=.*/COMPRESSION="zstd"/' /etc/mkinitcpio.conf
-  mkinitcpio -p linux
-  info "Initramfs rebuilt with encrypt hook and zstd compression"
 }
 
 configure_network() {
@@ -492,13 +443,13 @@ configure_bootloader() {
 
   local root_uuid ucode_initrd=""
   root_uuid=$(blkid -s UUID -o value "${PART}2")
-  [[ -n "$root_uuid" ]] || { echo "ERROR: Could not determine root LUKS partition UUID." >&2; exit 1; }
+  [[ -n "$root_uuid" ]] || { echo "ERROR: Could not determine root partition UUID." >&2; exit 1; }
   [[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found." >&2; exit 1; }
   [[ -n "$UCODE" ]] && ucode_initrd="initrd=\\${UCODE}.img "
 
   efibootmgr --create --disk "$DISK" --part 1 --label "$boot_label" \
     --loader /vmlinuz-linux \
-    --unicode "cryptdevice=UUID=${root_uuid}:cryptroot root=/dev/mapper/cryptroot rw ${ucode_initrd}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1 rd.lvm=0" \
+    --unicode "root=UUID=${root_uuid} rw ${ucode_initrd}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1" \
     --verbose
   info "EFISTUB boot entry created: $boot_label"
 }
@@ -506,7 +457,6 @@ configure_bootloader() {
 configure_pacman
 configure_locale
 configure_hostname
-configure_encryption
 configure_network
 configure_ssh
 configure_users
@@ -520,16 +470,15 @@ EOF
 # SUMMARY & REBOOT
 # ══════════════════════════════════════════════════════════════════════════════
 show_summary() {
-  local pkg_count part1_size part2_size part3_size
+  local pkg_count part1_size part2_size
   pkg_count=$(arch-chroot /mnt pacman -Q 2>/dev/null | wc -l)
   part1_size=$(lsblk -dno SIZE "${PART}1" 2>/dev/null)
   part2_size=$(lsblk -dno SIZE "${PART}2" 2>/dev/null)
-  part3_size=$(lsblk -dno SIZE "${PART}3" 2>/dev/null)
   clear
   cat <<SUMMARY
-══════════════════════════════════════════════════════════════════════════════
+═════════════════════════════════════════════════════════════════════════════
   Arch Linux Installation Complete
-══════════════════════════════════════════════════════════════════════════════
+═════════════════════════════════════════════════════════════════════════════
 
   Hostname:   $HOSTNAME
   Username:   $USERNAME
@@ -538,18 +487,16 @@ show_summary() {
   Packages:   $pkg_count
 
   Disk:       $DISK
-    ${PART}1  EFI_SYSTEM  ${part1_size}   /boot      (unencrypted)
-    ${PART}2  ROOT        ${part2_size}   /          (LUKS2)
-    ${PART}3  HOME        ${part3_size}   /home      (LUKS2, keyfile)
+    ${PART}1  EFI_SYSTEM  ${part1_size}   /boot
+    ${PART}2  ROOT        ${part2_size}   /
 
   Services:   sshd, systemd-networkd, systemd-resolved, systemd-timesyncd, fstrim.timer
   Bootloader: EFISTUB (linux)
   Microcode:  ${UCODE:-none}
-  Encryption: LUKS2 — enter passphrase at boot
 
   SSH key:    ${SSH_PUBKEY:+deployed}${SSH_PUBKEY:-not provided — add key to ~/.ssh/authorized_keys before using SSH}
 
-══════════════════════════════════════════════════════════════════════════════
+═════════════════════════════════════════════════════════════════════════════
 SUMMARY
 }
 
@@ -582,7 +529,6 @@ main() {
   partition_disk
   partprobe "$DISK" 2>/dev/null || true
   udevadm settle
-  encrypt_partitions
   format_partitions
   mount_partitions
 
