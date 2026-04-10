@@ -45,6 +45,8 @@ check_prerequisites() {
   info "Checking network connectivity..."
   ping -c1 -W5 archlinux.org &>/dev/null || die "No network connectivity. Connect to the internet and try again."
 
+  sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+
   command -v dialog     &>/dev/null || { info "Installing dialog...";     pacman -Sy --noconfirm dialog;     }
   command -v sgdisk     &>/dev/null || { info "Installing gptfdisk...";   pacman -Sy --noconfirm gptfdisk;   }
   command -v parted     &>/dev/null || { info "Installing parted...";     pacman -Sy --noconfirm parted;     }
