@@ -10,8 +10,8 @@ readonly TIMEZONE="Europe/Vienna"
 
 USERNAME=""
 PW_HASH=""
-LUKS_PASS=""         # plaintext passphrase — cleared after LUKS setup
-LUKS_HOME_KEYFILE="" # temp path to home keyfile — shredded after install
+LUKS_PASS=""         # plaintext — cleared after LUKS setup
+LUKS_HOME_KEYFILE="" # temp keyfile path — shredded after install
 UCODE=""
 DISK=""
 PART=""
@@ -21,16 +21,41 @@ PART=""
 # ══════════════════════════════════════════════════════════════════════════════
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
+step() { echo; echo "──── $* ────"; }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Set PART prefix — NVMe/MMC devices need 'p' before the partition number
+set_part_prefix() {
+  [[ "$DISK" =~ [0-9]$ ]] && PART="${DISK}p" || PART="$DISK"
+}
+
+# Install a package if the command is not already present
+ensure_pkg() {
+  local cmd="$1" pkg="${2:-$1}"
+  command -v "$cmd" &>/dev/null || { info "Installing $pkg..."; pacman -S --noconfirm "$pkg"; }
+}
+
+# Returns 0 if the given block device contains an NTFS filesystem
+is_windows_disk() {
+  lsblk -no FSTYPE "$1" 2>/dev/null | grep -qi ntfs
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLEANUP
 # ══════════════════════════════════════════════════════════════════════════════
-cleanup() {
-  local exit_code=$?
+teardown() {
   umount -R /mnt 2>/dev/null || true
   cryptsetup close crypthome 2>/dev/null || true
   cryptsetup close cryptroot 2>/dev/null || true
   [[ -n "$LUKS_HOME_KEYFILE" ]] && shred -u "$LUKS_HOME_KEYFILE" 2>/dev/null || true
+}
+
+cleanup() {
+  local exit_code=$?
+  teardown
   exit $exit_code
 }
 trap cleanup EXIT
@@ -38,21 +63,24 @@ trap cleanup EXIT
 # ══════════════════════════════════════════════════════════════════════════════
 # PREREQUISITES
 # ══════════════════════════════════════════════════════════════════════════════
-check_prerequisites() {
+check_environment() {
   [[ $EUID -eq 0 ]]                  || die "Must be run as root."
   [[ -d /sys/firmware/efi/efivars ]] || die "Not booted in UEFI mode."
-
   info "Checking network connectivity..."
   ping -c1 -W5 archlinux.org &>/dev/null || die "No network connectivity. Connect to the internet and try again."
+}
 
+ensure_tools() {
   sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+  pacman -Sy
+  ensure_pkg dialog
+  ensure_pkg sgdisk   gptfdisk
+  ensure_pkg parted
+  ensure_pkg openssl
+  ensure_pkg cryptsetup
+}
 
-  command -v dialog     &>/dev/null || { info "Installing dialog...";     pacman -Sy --noconfirm dialog;     }
-  command -v sgdisk     &>/dev/null || { info "Installing gptfdisk...";   pacman -Sy --noconfirm gptfdisk;   }
-  command -v parted     &>/dev/null || { info "Installing parted...";     pacman -Sy --noconfirm parted;     }
-  command -v openssl    &>/dev/null || { info "Installing openssl...";    pacman -Sy --noconfirm openssl;    }
-  command -v cryptsetup &>/dev/null || { info "Installing cryptsetup..."; pacman -Sy --noconfirm cryptsetup; }
-
+detect_ucode() {
   case $(grep -m1 'vendor_id' /proc/cpuinfo) in
     *GenuineIntel*) UCODE="intel-ucode" ;;
     *AuthenticAMD*) UCODE="amd-ucode"   ;;
@@ -62,46 +90,42 @@ check_prerequisites() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USER SETUP
+# USER INPUT
 # ══════════════════════════════════════════════════════════════════════════════
 prompt_username() {
   if [[ -n "$USERNAME" ]]; then
-    info "Using provided username: $USERNAME"
-    return 0
+    info "Using provided username: $USERNAME"; return 0
   fi
 
   while true; do
-    USERNAME=$(dialog --clear --inputbox "Enter username:" 8 40 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
-    if [[ -z "$USERNAME" ]]; then
-      dialog --msgbox "Username cannot be empty." 6 40
-    elif [[ "$USERNAME" == "root" ]]; then
-      dialog --msgbox "'root' is not allowed as a username." 6 45
-    elif [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-      dialog --msgbox "Invalid username. Use lowercase letters, numbers, '-' or '_'.\nMust start with a letter or underscore." 7 55
-    else
-      break
+    USERNAME=$(dialog --clear --inputbox "Enter username:" 8 40 3>&1 1>&2 2>&3) \
+      || { clear; die "Aborted."; }
+    if   [[ -z "$USERNAME" ]];                         then dialog --msgbox "Username cannot be empty." 6 40
+    elif [[ "$USERNAME" == "root" ]];                  then dialog --msgbox "'root' is reserved." 6 40
+    elif [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then dialog --msgbox "Invalid username. Use lowercase letters, numbers, '-' or '_'. Must start with a letter or underscore." 7 60
+    else break
     fi
   done
   clear
-  info "Username set to: $USERNAME"
+  info "Username: $USERNAME"
 }
 
 prompt_password() {
   if [[ -n "$PW_HASH" ]]; then
-    # Non-interactive mode: LUKS_PASS must also be set for disk encryption
     [[ -n "$LUKS_PASS" ]] || die "LUKS_PASS must be set alongside PW_HASH (needed for disk encryption)."
-    info "Using provided password hash"
-    return 0
+    info "Using provided password hash"; return 0
   fi
 
   local pass1 pass2
   while true; do
-    pass1=$(dialog --clear --insecure --passwordbox "Enter password for disk encryption, root, and $USERNAME:" 9 60 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
+    pass1=$(dialog --clear --insecure --passwordbox \
+      "Enter password for disk encryption, root, and $USERNAME:" 9 60 3>&1 1>&2 2>&3) \
+      || { clear; die "Aborted."; }
     [[ -n "$pass1" ]] || { dialog --msgbox "Password cannot be empty." 6 40; continue; }
 
-    pass2=$(dialog --clear --insecure --passwordbox "Confirm password:" 8 40 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
+    pass2=$(dialog --clear --insecure --passwordbox "Confirm password:" 8 40 3>&1 1>&2 2>&3) \
+      || { clear; die "Aborted."; }
     [[ "$pass1" == "$pass2" ]] && break
-
     dialog --msgbox "Passwords do not match. Try again." 6 40
   done
   clear
@@ -114,42 +138,40 @@ prompt_password() {
 # ══════════════════════════════════════════════════════════════════════════════
 # DISK SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Outputs alternating "path\nlabel\n" pairs for consumption by dialog --menu
+build_disk_menu() {
+  while IFS= read -r dev; do
+    local path="/dev/$dev" size model label
+    size=$(lsblk  -dno SIZE  "$path" 2>/dev/null)
+    model=$(lsblk -dno MODEL "$path" 2>/dev/null | xargs)
+    is_windows_disk "$path" && label="[WINDOWS] ${size} ${model}" || label="${size} ${model}"
+    printf '%s\n%s\n' "$path" "$label"
+  done < <(lsblk -dno NAME,RM -e 7,11 | awk '$2 == 0 {print $1}')
+}
+
 select_disk() {
   if [[ -n "$DISK" ]]; then
     info "Using provided disk: $DISK"
-    [[ "$DISK" =~ [0-9]$ ]] && PART="${DISK}p" || PART="$DISK"
-    return 0
+    set_part_prefix; return 0
   fi
 
   while [[ -z "$DISK" ]]; do
-    local menu_items=()
+    local -a menu_items
+    mapfile -t menu_items < <(build_disk_menu)
 
-    while IFS= read -r dev; do
-      local path="/dev/$dev"
-      local size model label
-      size=$(lsblk  -dno SIZE  "$path" 2>/dev/null)
-      model=$(lsblk -dno MODEL "$path" 2>/dev/null | xargs)
-
-      if lsblk -no FSTYPE "$path" 2>/dev/null | grep -qi ntfs; then
-        label="[WINDOWS] ${size} ${model}"
-      else
-        label="${size} ${model}"
-      fi
-      menu_items+=("$path" "$label")
-    done < <(lsblk -dno NAME,RM -e 7,11 | awk '$2 == 0 {print $1}')
-
-    [[ ${#menu_items[@]} -eq 0 ]] && { dialog --msgbox "No suitable disks found." 6 40; clear; exit 1; }
+    [[ ${#menu_items[@]} -gt 0 ]] || { dialog --msgbox "No suitable disks found." 6 40; clear; exit 1; }
 
     local chosen
     chosen=$(dialog --clear --title "Arch Installer" \
       --menu "Select installation drive: (drives marked [WINDOWS] are blocked)" \
-      20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
+      20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || { clear; die "Aborted."; }
 
-    if lsblk -no FSTYPE "$chosen" 2>/dev/null | grep -qi ntfs; then
+    if is_windows_disk "$chosen"; then
       dialog --msgbox "$chosen contains a Windows installation and cannot be used.\n\nPlease select a different drive." 9 55
     else
       DISK="$chosen"
-      [[ "$DISK" =~ [0-9]$ ]] && PART="${DISK}p" || PART="$DISK"
+      set_part_prefix
     fi
   done
   clear
@@ -158,15 +180,14 @@ select_disk() {
 confirm_install() {
   local disk_info
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
-
   dialog --clear --title "Confirm Installation" \
     --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:       $USERNAME\nHostname:   $HOSTNAME\nLocale:     $LOCALE\nEncryption: LUKS2 (root + home)\n\nProceed with installation?" \
-    22 60 || { clear; echo "Aborted."; exit 1; }
+    22 60 || { clear; die "Aborted."; }
   clear
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PARTITIONING
+# DISK SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 partition_disk() {
   local disk_mib
@@ -204,9 +225,7 @@ encrypt_partitions() {
   cryptsetup luksFormat --type luks2 --batch-mode --key-file "$LUKS_HOME_KEYFILE" "${PART}3"
   cryptsetup open --type luks2 --key-file "$LUKS_HOME_KEYFILE" "${PART}3" crypthome
 
-  # Clear plaintext passphrase — no longer needed after this point
   LUKS_PASS=""
-  info "Disk encryption configured"
 }
 
 format_partitions() {
@@ -215,9 +234,6 @@ format_partitions() {
   mkfs.ext4 -F  -L home       /dev/mapper/crypthome
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MOUNT
-# ══════════════════════════════════════════════════════════════════════════════
 mount_partitions() {
   mount /dev/mapper/cryptroot /mnt
   mkdir -p /mnt/{boot,home}
@@ -241,9 +257,6 @@ install_base() {
   pacstrap /mnt "${pkgs[@]}"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FSTAB
-# ══════════════════════════════════════════════════════════════════════════════
 generate_fstab() {
   genfstab -U /mnt > /mnt/etc/fstab
   sed -i 's/\brelatime\b/noatime/g' /mnt/etc/fstab
@@ -252,16 +265,21 @@ generate_fstab() {
 # ══════════════════════════════════════════════════════════════════════════════
 # CHROOT CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-configure_chroot() {
-  echo "$PW_HASH" > /mnt/root/.pwhash
+
+# Copy files needed inside chroot before entering
+stage_chroot_files() {
+  printf '%s\n' "$PW_HASH" > /mnt/root/.pwhash
   chmod 600 /mnt/root/.pwhash
 
-  # Install home LUKS keyfile onto the target system, then shred the temp copy
   mkdir -p /mnt/etc/luks-keys
   install -m 600 "$LUKS_HOME_KEYFILE" /mnt/etc/luks-keys/home.key
   chmod 700 /mnt/etc/luks-keys
   shred -u "$LUKS_HOME_KEYFILE"
   LUKS_HOME_KEYFILE=""
+}
+
+configure_chroot() {
+  stage_chroot_files
 
   local home_uuid
   home_uuid=$(blkid -s UUID -o value "${PART}3")
@@ -278,53 +296,44 @@ configure_chroot() {
     HOME_UUID="$home_uuid" \
     /bin/bash <<'EOF'
 set -euo pipefail
+info() { echo "==> $*"; }
 
-enable_multilib() {
+configure_pacman() {
   sed -i '/^#\[multilib\]/,/^#Include/s/^#//' /etc/pacman.conf
-  echo "==> Multilib repository enabled"
+  sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+  info "Pacman: multilib enabled, parallel downloads = 5"
 }
 
-PW_HASH=$(cat /root/.pwhash)
-shred -u /root/.pwhash
+configure_locale() {
+  grep -qxF "$LOCALE UTF-8" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
+  locale-gen
+  echo "LANG=$LOCALE" > /etc/locale.conf
+  echo 'KEYMAP=us'    > /etc/vconsole.conf
+  ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  hwclock --systohc
+  info "Locale: $LOCALE, timezone: $TIMEZONE"
+}
 
-# Localization
-grep -qxF "$LOCALE UTF-8" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
-locale-gen
-
-# Enable multilib and parallel downloads
-enable_multilib
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-echo "LANG=$LOCALE" > /etc/locale.conf
-echo 'KEYMAP=us'    > /etc/vconsole.conf
-ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
-hwclock --systohc
-
-# Hostname
-echo "$HOSTNAME" > /etc/hostname
-cat > /etc/hosts <<HOSTS
+configure_hostname() {
+  echo "$HOSTNAME" > /etc/hostname
+  cat > /etc/hosts <<HOSTS
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
+  info "Hostname: $HOSTNAME"
+}
 
-# crypttab — unlock home at boot using keyfile stored on the encrypted root
-echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
+configure_encryption() {
+  echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
+  sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
+  sed -i 's/^#*COMPRESSION=.*/COMPRESSION="zstd"/' /etc/mkinitcpio.conf
+  mkinitcpio -P
+  info "Initramfs rebuilt with encrypt hook and zstd compression"
+}
 
-# mkinitcpio — insert encrypt hook, switch to zstd for faster boot
-sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
-sed -i 's/^#*COMPRESSION=.*/COMPRESSION="zstd"/' /etc/mkinitcpio.conf
-mkinitcpio -P
-
-# Services
-systemctl enable sshd
-systemctl enable systemd-timesyncd
-systemctl enable systemd-networkd
-systemctl enable systemd-resolved
-systemctl enable fstrim.timer
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-
-# Network — DHCP on wired and wireless
-cat > /etc/systemd/network/20-wired.network <<NETCONF
+configure_network() {
+  cat > /etc/systemd/network/20-wired.network <<NETCONF
 [Match]
 Name=en*
 
@@ -335,7 +344,7 @@ DHCP=yes
 RouteMetric=10
 NETCONF
 
-cat > /etc/systemd/network/25-wireless.network <<NETCONF
+  cat > /etc/systemd/network/25-wireless.network <<NETCONF
 [Match]
 Name=wl*
 
@@ -346,34 +355,66 @@ DHCP=yes
 RouteMetric=20
 NETCONF
 
-# SSH hardening — key-based auth only, no root login
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/'              /etc/ssh/sshd_config
+  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  info "Network: wired + wireless DHCP configured"
+}
 
-# User setup — sudo requires password
-useradd -m -G wheel -s /bin/bash "$USERNAME"
-echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
-chmod 0440 /etc/sudoers.d/wheel
+configure_ssh() {
+  sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/'              /etc/ssh/sshd_config
+  info "SSH: password auth disabled, root login disabled"
+}
 
-printf 'root:%s\n'           "$PW_HASH" | chpasswd -e
-printf '%s:%s\n' "$USERNAME" "$PW_HASH" | chpasswd -e
+configure_users() {
+  local pw_hash
+  pw_hash=$(cat /root/.pwhash)
+  shred -u /root/.pwhash
 
-# EFISTUB — clean up stale entries first
-while read -r bootnum; do
-  efibootmgr -b "$bootnum" -B
-done < <(efibootmgr -v | grep "Arch Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
+  useradd -m -G wheel -s /bin/bash "$USERNAME"
+  echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
+  chmod 0440 /etc/sudoers.d/wheel
 
-ROOT_UUID=$(blkid -s UUID -o value "${PART}2")
-[[ -n "$ROOT_UUID" ]] || { echo "ERROR: Could not determine root LUKS partition UUID." >&2; exit 1; }
+  printf 'root:%s\n'           "$pw_hash" | chpasswd -e
+  printf '%s:%s\n' "$USERNAME" "$pw_hash" | chpasswd -e
+  info "Users: root and $USERNAME configured"
+}
 
-[[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found." >&2; exit 1; }
+configure_services() {
+  systemctl enable sshd
+  systemctl enable systemd-timesyncd
+  systemctl enable systemd-networkd
+  systemctl enable systemd-resolved
+  systemctl enable fstrim.timer
+  info "Services enabled"
+}
 
-UCODE_INITRD=""
-[[ -n "$UCODE" ]] && UCODE_INITRD="initrd=\\${UCODE}.img "
+configure_bootloader() {
+  while read -r bootnum; do
+    efibootmgr -b "$bootnum" -B
+  done < <(efibootmgr -v | grep "Arch Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
 
-efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
+  local root_uuid ucode_initrd=""
+  root_uuid=$(blkid -s UUID -o value "${PART}2")
+  [[ -n "$root_uuid" ]] || { echo "ERROR: Could not determine root LUKS partition UUID." >&2; exit 1; }
+  [[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found." >&2; exit 1; }
+  [[ -n "$UCODE" ]] && ucode_initrd="initrd=\\${UCODE}.img "
+
+  efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
     --loader /vmlinuz-linux \
-    --unicode "cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1 rd.lvm=0" --verbose
+    --unicode "cryptdevice=UUID=${root_uuid}:cryptroot root=/dev/mapper/cryptroot rw ${ucode_initrd}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1 rd.lvm=0" \
+    --verbose
+  info "EFISTUB boot entry created"
+}
+
+configure_pacman
+configure_locale
+configure_hostname
+configure_encryption
+configure_network
+configure_ssh
+configure_users
+configure_services
+configure_bootloader
 
 EOF
 }
@@ -381,7 +422,6 @@ EOF
 # ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY & REBOOT
 # ══════════════════════════════════════════════════════════════════════════════
-
 show_summary() {
   local pkg_count part1_size part2_size part3_size
   pkg_count=$(arch-chroot /mnt pacman -Q 2>/dev/null | wc -l)
@@ -420,11 +460,7 @@ SUMMARY
 prompt_reboot() {
   echo ""
   read -rp "  Press ENTER to unmount and reboot..."
-  info "Unmounting..."
-  umount -R /mnt 2>/dev/null || true
-  cryptsetup close crypthome 2>/dev/null || true
-  cryptsetup close cryptroot 2>/dev/null || true
-  info "Rebooting..."
+  teardown
   reboot
 }
 
@@ -432,34 +468,29 @@ prompt_reboot() {
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
-  check_prerequisites
+  step "Checking prerequisites"
+  check_environment
+  ensure_tools
+  detect_ucode
 
+  step "Collecting installation parameters"
   prompt_username
   prompt_password
-
   select_disk
   confirm_install
 
-  info "Partitioning $DISK..."
+  step "Preparing disk: $DISK"
   partition_disk
   partprobe "$DISK" || die "partprobe failed. Partition table may not be updated."
-
-  info "Setting up LUKS2 encryption..."
   encrypt_partitions
-
-  info "Formatting partitions..."
   format_partitions
-
-  info "Mounting partitions..."
   mount_partitions
 
-  info "Installing base system..."
+  step "Installing base system"
   install_base
-
-  info "Generating fstab..."
   generate_fstab
 
-  info "Configuring system in chroot..."
+  step "Configuring installed system"
   configure_chroot
 
   show_summary
