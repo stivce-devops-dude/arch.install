@@ -9,6 +9,7 @@ readonly HOSTNAME="arch-meta"
 readonly TIMEZONE="Europe/Vienna"
 
 USERNAME=""
+PASSWORD=""          # plaintext — used to derive PW_HASH + LUKS_PASS; cleared after use
 PW_HASH=""
 LUKS_PASS=""         # plaintext — cleared after LUKS setup
 LUKS_HOME_KEYFILE="" # temp keyfile path — shredded after install
@@ -16,6 +17,32 @@ SSH_PUBKEY=""        # optional — deployed to ~/.ssh/authorized_keys
 UCODE=""
 DISK=""
 PART=""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENV FILE
+# ══════════════════════════════════════════════════════════════════════════════
+load_env_file() {
+  local env_file="${1:-$(dirname "$(realpath "$0")")/.env}"
+  [[ -f "$env_file" ]] || return 0
+  info "Loading config from $env_file"
+
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip comments and blank lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]]           && continue
+    # Accept KEY=value or KEY="value" or KEY='value'
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      # Strip surrounding quotes
+      if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+        value="${BASH_REMATCH[1]}"
+      fi
+      printf -v "$key" '%s' "$value"
+    fi
+  done < "$env_file"
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -119,6 +146,13 @@ prompt_username() {
 }
 
 prompt_password() {
+  if [[ -n "$PASSWORD" ]]; then
+    LUKS_PASS="$PASSWORD"
+    PW_HASH=$(printf '%s' "$PASSWORD" | openssl passwd -6 -stdin)
+    PASSWORD=""
+    info "Password hash derived from PASSWORD"; return 0
+  fi
+
   if [[ -n "$PW_HASH" ]]; then
     [[ -n "$LUKS_PASS" ]] || die "LUKS_PASS must be set alongside PW_HASH (needed for disk encryption)."
     info "Using provided password hash"; return 0
@@ -520,6 +554,8 @@ prompt_reboot() {
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
+  load_env_file "${1:-}"
+
   step "Checking prerequisites"
   check_environment
   ensure_tools
