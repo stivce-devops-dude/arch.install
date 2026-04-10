@@ -10,6 +10,8 @@ readonly TIMEZONE="Europe/Vienna"
 
 USERNAME=""
 PW_HASH=""
+LUKS_PASS=""         # plaintext passphrase — cleared after LUKS setup
+LUKS_HOME_KEYFILE="" # temp path to home keyfile — shredded after install
 UCODE=""
 DISK=""
 PART=""
@@ -26,6 +28,9 @@ info() { echo "==> $*"; }
 cleanup() {
   local exit_code=$?
   umount -R /mnt 2>/dev/null || true
+  cryptsetup close crypthome 2>/dev/null || true
+  cryptsetup close cryptroot 2>/dev/null || true
+  [[ -n "$LUKS_HOME_KEYFILE" ]] && shred -u "$LUKS_HOME_KEYFILE" 2>/dev/null || true
   exit $exit_code
 }
 trap cleanup EXIT
@@ -40,10 +45,11 @@ check_prerequisites() {
   info "Checking network connectivity..."
   ping -c1 -W5 archlinux.org &>/dev/null || die "No network connectivity. Connect to the internet and try again."
 
-  command -v dialog  &>/dev/null     || { info "Installing dialog...";   pacman -Sy --noconfirm dialog;   }
-  command -v sgdisk  &>/dev/null     || { info "Installing gptfdisk..."; pacman -Sy --noconfirm gptfdisk; }
-  command -v parted  &>/dev/null     || { info "Installing parted...";   pacman -Sy --noconfirm parted;   }
-  command -v openssl &>/dev/null     || { info "Installing openssl...";  pacman -Sy --noconfirm openssl;  }
+  command -v dialog     &>/dev/null || { info "Installing dialog...";     pacman -Sy --noconfirm dialog;     }
+  command -v sgdisk     &>/dev/null || { info "Installing gptfdisk...";   pacman -Sy --noconfirm gptfdisk;   }
+  command -v parted     &>/dev/null || { info "Installing parted...";     pacman -Sy --noconfirm parted;     }
+  command -v openssl    &>/dev/null || { info "Installing openssl...";    pacman -Sy --noconfirm openssl;    }
+  command -v cryptsetup &>/dev/null || { info "Installing cryptsetup..."; pacman -Sy --noconfirm cryptsetup; }
 
   case $(grep -m1 'vendor_id' /proc/cpuinfo) in
     *GenuineIntel*) UCODE="intel-ucode" ;;
@@ -80,13 +86,15 @@ prompt_username() {
 
 prompt_password() {
   if [[ -n "$PW_HASH" ]]; then
+    # Non-interactive mode: LUKS_PASS must also be set for disk encryption
+    [[ -n "$LUKS_PASS" ]] || die "LUKS_PASS must be set alongside PW_HASH (needed for disk encryption)."
     info "Using provided password hash"
     return 0
   fi
 
   local pass1 pass2
   while true; do
-    pass1=$(dialog --clear --insecure --passwordbox "Enter password for root and $USERNAME:" 8 50 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
+    pass1=$(dialog --clear --insecure --passwordbox "Enter password for disk encryption, root, and $USERNAME:" 9 60 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
     [[ -n "$pass1" ]] || { dialog --msgbox "Password cannot be empty." 6 40; continue; }
 
     pass2=$(dialog --clear --insecure --passwordbox "Confirm password:" 8 40 3>&1 1>&2 2>&3) || { clear; echo "Aborted."; exit 1; }
@@ -95,7 +103,9 @@ prompt_password() {
     dialog --msgbox "Passwords do not match. Try again." 6 40
   done
   clear
-  PW_HASH=$(openssl passwd -6 "$pass1")
+
+  LUKS_PASS="$pass1"
+  PW_HASH=$(printf '%s' "$pass1" | openssl passwd -6 -stdin)
   info "Password hash generated"
 }
 
@@ -103,7 +113,12 @@ prompt_password() {
 # DISK SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
 select_disk() {
-  DISK=""
+  if [[ -n "$DISK" ]]; then
+    info "Using provided disk: $DISK"
+    [[ "$DISK" =~ [0-9]$ ]] && PART="${DISK}p" || PART="$DISK"
+    return 0
+  fi
+
   while [[ -z "$DISK" ]]; do
     local menu_items=()
 
@@ -143,8 +158,8 @@ confirm_install() {
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
 
   dialog --clear --title "Confirm Installation" \
-    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:     $USERNAME\nHostname: $HOSTNAME\nLocale:   $LOCALE\n\nProceed with installation?" \
-    20 60 || { clear; echo "Aborted."; exit 1; }
+    --yesno "WARNING: All data on the selected disk will be permanently destroyed.\n\nDisk contents:\n$disk_info\n\nUser:       $USERNAME\nHostname:   $HOSTNAME\nLocale:     $LOCALE\nEncryption: LUKS2 (root + home)\n\nProceed with installation?" \
+    22 60 || { clear; echo "Aborted."; exit 1; }
   clear
 }
 
@@ -174,20 +189,38 @@ partition_disk() {
     name 3 HOME
 }
 
+encrypt_partitions() {
+  info "Encrypting root partition with LUKS2..."
+  printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode -d - "${PART}2"
+  printf '%s' "$LUKS_PASS" | cryptsetup open --type luks2 -d - "${PART}2" cryptroot
+
+  info "Generating home partition keyfile..."
+  LUKS_HOME_KEYFILE=$(mktemp)
+  dd if=/dev/urandom bs=512 count=4 2>/dev/null > "$LUKS_HOME_KEYFILE"
+
+  info "Encrypting home partition with LUKS2..."
+  cryptsetup luksFormat --type luks2 --batch-mode --key-file "$LUKS_HOME_KEYFILE" "${PART}3"
+  cryptsetup open --type luks2 --key-file "$LUKS_HOME_KEYFILE" "${PART}3" crypthome
+
+  # Clear plaintext passphrase — no longer needed after this point
+  LUKS_PASS=""
+  info "Disk encryption configured"
+}
+
 format_partitions() {
   mkfs.fat -F32 -n EFI_SYSTEM "${PART}1"
-  mkfs.ext4 -F  -L root       "${PART}2"
-  mkfs.ext4 -F  -L home       "${PART}3"
+  mkfs.ext4 -F  -L root       /dev/mapper/cryptroot
+  mkfs.ext4 -F  -L home       /dev/mapper/crypthome
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MOUNT
 # ══════════════════════════════════════════════════════════════════════════════
 mount_partitions() {
-  mount -L root /mnt
+  mount /dev/mapper/cryptroot /mnt
   mkdir -p /mnt/{boot,home}
   mount -L EFI_SYSTEM /mnt/boot
-  mount -L home       /mnt/home
+  mount /dev/mapper/crypthome /mnt/home
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,6 +230,7 @@ install_base() {
   local pkgs=(
     base base-devel
     linux linux-headers linux-firmware
+    cryptsetup
     efibootmgr
     dhcpcd
     openssh
@@ -220,6 +254,17 @@ configure_chroot() {
   echo "$PW_HASH" > /mnt/root/.pwhash
   chmod 600 /mnt/root/.pwhash
 
+  # Install home LUKS keyfile onto the target system, then shred the temp copy
+  mkdir -p /mnt/etc/luks-keys
+  install -m 600 "$LUKS_HOME_KEYFILE" /mnt/etc/luks-keys/home.key
+  chmod 700 /mnt/etc/luks-keys
+  shred -u "$LUKS_HOME_KEYFILE"
+  LUKS_HOME_KEYFILE=""
+
+  local home_uuid
+  home_uuid=$(blkid -s UUID -o value "${PART}3")
+  [[ -n "$home_uuid" ]] || die "Could not determine home partition UUID."
+
   arch-chroot /mnt /usr/bin/env \
     USERNAME="$USERNAME" \
     HOSTNAME="$HOSTNAME" \
@@ -228,11 +273,13 @@ configure_chroot() {
     DISK="$DISK" \
     PART="$PART" \
     UCODE="$UCODE" \
+    HOME_UUID="$home_uuid" \
     /bin/bash <<'EOF'
 set -euo pipefail
 
 enable_multilib() {
   sed -i '/^#\[multilib\]/,/^#Include/s/^#//' /etc/pacman.conf
+  echo "==> Multilib repository enabled"
 }
 
 PW_HASH=$(cat /root/.pwhash)
@@ -257,13 +304,25 @@ cat > /etc/hosts <<HOSTS
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
 
+# crypttab — unlock home at boot using keyfile stored on the encrypted root
+echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
+
+# mkinitcpio — insert encrypt hook before filesystems
+sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
+mkinitcpio -P
+
 # Services
 systemctl enable dhcpcd
 systemctl enable sshd
+systemctl enable systemd-timesyncd
 
-# User setup
+# SSH hardening — key-based auth only, no root login
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/'              /etc/ssh/sshd_config
+
+# User setup — sudo requires password
 useradd -m -G wheel -s /bin/bash "$USERNAME"
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
 
 printf 'root:%s\n'           "$PW_HASH" | chpasswd -e
@@ -275,16 +334,16 @@ while read -r bootnum; do
 done < <(efibootmgr -v | grep "Arch Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
 
 ROOT_UUID=$(blkid -s UUID -o value "${PART}2")
-[[ -n "$ROOT_UUID" ]] || { echo "ERROR: Could not determine root partition UUID." >&2; exit 1; }
+[[ -n "$ROOT_UUID" ]] || { echo "ERROR: Could not determine root LUKS partition UUID." >&2; exit 1; }
+
+[[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found." >&2; exit 1; }
 
 UCODE_INITRD=""
 [[ -n "$UCODE" ]] && UCODE_INITRD="initrd=\\${UCODE}.img "
 
-[[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found, aborting." >&2; exit 1; }
-
 efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
     --loader /vmlinuz-linux \
-    --unicode "root=UUID=${ROOT_UUID} rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 rd.luks=0 rd.lvm=0" --verbose
+    --unicode "cryptdevice=UUID=${ROOT_UUID}:cryptroot root=/dev/mapper/cryptroot rw ${UCODE_INITRD}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 rd.lvm=0" --verbose
 
 EOF
 }
@@ -312,13 +371,17 @@ show_summary() {
   Packages:   $pkg_count
 
   Disk:       $DISK
-    ${PART}1  EFI_SYSTEM  ${part1_size}   /boot
-    ${PART}2  ROOT        ${part2_size}   /
-    ${PART}3  HOME        ${part3_size}   /home
+    ${PART}1  EFI_SYSTEM  ${part1_size}   /boot      (unencrypted)
+    ${PART}2  ROOT        ${part2_size}   /          (LUKS2)
+    ${PART}3  HOME        ${part3_size}   /home      (LUKS2, keyfile)
 
-  Services:   dhcpcd, sshd
+  Services:   dhcpcd, sshd, systemd-timesyncd
   Bootloader: EFISTUB (linux)
   Microcode:  ${UCODE:-none}
+  Encryption: LUKS2 — enter passphrase at boot
+
+  NOTE: SSH password authentication is disabled.
+        Add your public key to ~/.ssh/authorized_keys before relying on SSH.
 
 ══════════════════════════════════════════════════════════════════════════════
 SUMMARY
@@ -329,6 +392,8 @@ prompt_reboot() {
   read -rp "  Press ENTER to unmount and reboot..."
   info "Unmounting..."
   umount -R /mnt 2>/dev/null || true
+  cryptsetup close crypthome 2>/dev/null || true
+  cryptsetup close cryptroot 2>/dev/null || true
   info "Rebooting..."
   reboot
 }
@@ -348,6 +413,9 @@ main() {
   info "Partitioning $DISK..."
   partition_disk
   partprobe "$DISK" || die "partprobe failed. Partition table may not be updated."
+
+  info "Setting up LUKS2 encryption..."
+  encrypt_partitions
 
   info "Formatting partitions..."
   format_partitions
