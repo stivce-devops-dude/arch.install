@@ -12,6 +12,7 @@ USERNAME=""
 PW_HASH=""
 LUKS_PASS=""         # plaintext — cleared after LUKS setup
 LUKS_HOME_KEYFILE="" # temp keyfile path — shredded after install
+SSH_PUBKEY=""        # optional — deployed to ~/.ssh/authorized_keys
 UCODE=""
 DISK=""
 PART=""
@@ -72,7 +73,7 @@ check_environment() {
 
 ensure_tools() {
   sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-  pacman -Sy
+  pacman -Syu --noconfirm
   ensure_pkg dialog
   ensure_pkg sgdisk   gptfdisk
   ensure_pkg parted
@@ -135,6 +136,31 @@ prompt_password() {
   info "Password hash generated"
 }
 
+prompt_ssh_key() {
+  if [[ -n "$SSH_PUBKEY" ]]; then
+    info "Using provided SSH public key"; return 0
+  fi
+
+  local key
+  key=$(dialog --clear --inputbox \
+    "Paste your SSH public key (leave empty to skip):" 10 70 3>&1 1>&2 2>&3) \
+    || { clear; die "Aborted."; }
+  clear
+
+  if [[ -z "$key" ]]; then
+    info "No SSH public key provided — key-based SSH login will not be available"
+    return 0
+  fi
+
+  # Validate key type prefix
+  if [[ ! "$key" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)[[:space:]] ]]; then
+    die "Invalid SSH public key format."
+  fi
+
+  SSH_PUBKEY="$key"
+  info "SSH public key accepted"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DISK SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +178,8 @@ build_disk_menu() {
 
 select_disk() {
   if [[ -n "$DISK" ]]; then
+    [[ -b "$DISK" ]]          || die "DISK=$DISK is not a block device."
+    ! is_windows_disk "$DISK" || die "DISK=$DISK contains a Windows installation. Refusing to proceed."
     info "Using provided disk: $DISK"
     set_part_prefix; return 0
   fi
@@ -294,6 +322,7 @@ configure_chroot() {
     PART="$PART" \
     UCODE="$UCODE" \
     HOME_UUID="$home_uuid" \
+    SSH_PUBKEY="$SSH_PUBKEY" \
     /bin/bash <<'EOF'
 set -euo pipefail
 info() { echo "==> $*"; }
@@ -328,7 +357,7 @@ configure_encryption() {
   echo "crypthome  UUID=$HOME_UUID  /etc/luks-keys/home.key  luks" >> /etc/crypttab
   sed -i '/^HOOKS=/s/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
   sed -i 's/^#*COMPRESSION=.*/COMPRESSION="zstd"/' /etc/mkinitcpio.conf
-  mkinitcpio -P
+  mkinitcpio -p linux
   info "Initramfs rebuilt with encrypt hook and zstd compression"
 }
 
@@ -376,7 +405,19 @@ configure_users() {
 
   printf 'root:%s\n'           "$pw_hash" | chpasswd -e
   printf '%s:%s\n' "$USERNAME" "$pw_hash" | chpasswd -e
-  info "Users: root and $USERNAME configured"
+
+  if [[ -n "$SSH_PUBKEY" ]]; then
+    local ssh_dir="/home/$USERNAME/.ssh"
+    mkdir -p "$ssh_dir"
+    printf '%s\n' "$SSH_PUBKEY" > "$ssh_dir/authorized_keys"
+    chmod 700 "$ssh_dir"
+    chmod 600 "$ssh_dir/authorized_keys"
+    chown -R "$USERNAME:$USERNAME" "$ssh_dir"
+    info "SSH: public key deployed for $USERNAME"
+  fi
+
+  echo 'umask 027' > /etc/profile.d/umask.sh
+  info "Users: root and $USERNAME configured, umask 027 set"
 }
 
 configure_services() {
@@ -389,9 +430,12 @@ configure_services() {
 }
 
 configure_bootloader() {
+  local boot_label="Arch Speed Meta"
+
+  # Remove all stale entries with our label before creating a new one
   while read -r bootnum; do
-    efibootmgr -b "$bootnum" -B
-  done < <(efibootmgr -v | grep "Arch Speed Meta" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
+    efibootmgr -b "$bootnum" -B 2>/dev/null || true
+  done < <(efibootmgr -v | grep -F "$boot_label" | grep -oP 'Boot\K[0-9A-Fa-f]{4}')
 
   local root_uuid ucode_initrd=""
   root_uuid=$(blkid -s UUID -o value "${PART}2")
@@ -399,11 +443,11 @@ configure_bootloader() {
   [[ -f /boot/initramfs-linux.img ]] || { echo "ERROR: initramfs not found." >&2; exit 1; }
   [[ -n "$UCODE" ]] && ucode_initrd="initrd=\\${UCODE}.img "
 
-  efibootmgr --create --disk "$DISK" --part 1 --label "Arch Speed Meta" \
+  efibootmgr --create --disk "$DISK" --part 1 --label "$boot_label" \
     --loader /vmlinuz-linux \
     --unicode "cryptdevice=UUID=${root_uuid}:cryptroot root=/dev/mapper/cryptroot rw ${ucode_initrd}initrd=\initramfs-linux.img quiet loglevel=3 nowatchdog nmi_watchdog=0 zswap.enabled=0 page_alloc.shuffle=1 rd.lvm=0" \
     --verbose
-  info "EFISTUB boot entry created"
+  info "EFISTUB boot entry created: $boot_label"
 }
 
 configure_pacman
@@ -450,8 +494,7 @@ show_summary() {
   Microcode:  ${UCODE:-none}
   Encryption: LUKS2 — enter passphrase at boot
 
-  NOTE: SSH password authentication is disabled.
-        Add your public key to ~/.ssh/authorized_keys before relying on SSH.
+  SSH key:    ${SSH_PUBKEY:+deployed}${SSH_PUBKEY:-not provided — add key to ~/.ssh/authorized_keys before using SSH}
 
 ══════════════════════════════════════════════════════════════════════════════
 SUMMARY
@@ -476,6 +519,7 @@ main() {
   step "Collecting installation parameters"
   prompt_username
   prompt_password
+  prompt_ssh_key
   select_disk
   confirm_install
 
