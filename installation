@@ -73,7 +73,7 @@ check_environment() {
 
 ensure_tools() {
   sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-  pacman -Syu --noconfirm
+  pacman -Sy --noconfirm
   ensure_pkg dialog
   ensure_pkg sgdisk   gptfdisk
   ensure_pkg parted
