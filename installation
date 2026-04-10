@@ -393,7 +393,7 @@ DHCP=yes
 RouteMetric=20
 NETCONF
 
-  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
   info "Network: wired + wireless DHCP configured"
 }
 
