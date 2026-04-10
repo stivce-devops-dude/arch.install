@@ -182,6 +182,11 @@ prompt_ssh_key() {
     info "Using provided SSH public key"; return 0
   fi
 
+  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
+    info "No SSH public key provided — key-based SSH login will not be available"
+    return 0
+  fi
+
   local key
   key=$(dialog --clear --inputbox \
     "Paste your SSH public key (leave empty to skip):" 10 70 3>&1 1>&2 2>&3) \
@@ -247,6 +252,11 @@ select_disk() {
 }
 
 confirm_install() {
+  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
+    info "Non-interactive mode — skipping confirmation, proceeding with install"
+    return 0
+  fi
+
   local disk_info
   disk_info=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DISK" 2>/dev/null)
   dialog --clear --title "Confirm Installation" \
