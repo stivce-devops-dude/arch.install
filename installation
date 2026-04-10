@@ -342,16 +342,18 @@ trap 'die "Chroot configuration failed at line $LINENO."' ERR
 configure_pacman() {
   sed -i '/^#\[multilib\]/,/^#Include/s/^#//' /etc/pacman.conf
   sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-  info "Pacman: multilib enabled, parallel downloads = 5"
+  pacman -Syyuu --noconfirm
+  info "Pacman: multilib enabled, parallel downloads = 5, system upgraded"
 }
 
 configure_locale() {
   grep -qxF "$LOCALE UTF-8" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
   locale-gen
   echo "LANG=$LOCALE" > /etc/locale.conf
-  echo 'KEYMAP=us'    > /etc/vconsole.conf
+  echo "KEYMAP=us"    > /etc/vconsole.conf
   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
   hwclock --systohc 2>/dev/null || true
+  mkinitcpio -p linux
   info "Locale: $LOCALE, timezone: $TIMEZONE"
 }
 
