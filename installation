@@ -228,13 +228,13 @@ mount_partitions() {
 # ══════════════════════════════════════════════════════════════════════════════
 install_base() {
   local pkgs=(
-    base base-devel
-    linux linux-headers linux-firmware
+    base
+    linux linux-firmware
     cryptsetup
     efibootmgr
     dhcpcd
     openssh
-    sudo python git ansible neovim
+    sudo git neovim
   )
   [[ -n "$UCODE" ]] && pkgs+=("$UCODE")
   pacstrap /mnt "${pkgs[@]}"
